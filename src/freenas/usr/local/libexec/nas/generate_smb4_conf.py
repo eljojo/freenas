@@ -43,13 +43,18 @@ logging.config.dictConfig({
     }
 })
 
+truenas_params = {
+    'is_truenas_ha': False,
+    'failover_status': 'DEFAULT',
+    'smb_ha_mode': 'LEGACY',
+    'registry_config': False,
+}
+
 from freenasUI.common.pipesubr import pipeopen
 from freenasUI.common.log import log_traceback
 from freenasUI.common.freenassysctl import freenas_sysctl as fs
 
 log = logging.getLogger('generate_smb4_conf')
-
-is_truenas_ha = False
 
 
 def qw(w):
@@ -862,6 +867,10 @@ def add_domaincontroller_conf(client, smb4_conf):
     confset2(smb4_conf, "dns forwarder = %s", dc.dc_dns_forwarder)
     confset1(smb4_conf, "idmap_ldb:use rfc2307 = yes")
 
+    # We have to manually add vfs objects here until we get more general fix to DC
+    # code in loadparm.c
+    confset1(smb4_conf, "vfs objects = dfs_samba4 zfsacl")
+
     # confset2(smb4_conf, "server services = %s",
     #    string.join(server_services, ',').rstrip(','))
     # confset2(smb4_conf, "dcerpc endpoint servers = %s",
@@ -931,8 +940,6 @@ def generate_smb4_tdb(client, smb4_tdb):
 
 
 def generate_smb4_conf(client, smb4_conf, role):
-    global is_truenas_ha
-
     cifs = Struct(client.call('smb.config'))
 
     if not cifs.guest:
@@ -948,9 +955,10 @@ def generate_smb4_conf(client, smb4_conf, role):
     if os.path.exists("/usr/local/etc/smbusers"):
         confset1(smb4_conf, "username map = /usr/local/etc/smbusers")
 
-    server_min_protocol = fs().services.smb.config.server_min_protocol
-    if server_min_protocol != 'NONE':
-        confset2(smb4_conf, "server min protocol = %s", server_min_protocol)
+    if not cifs.enable_smb1:
+        confset1(smb4_conf, "server min protocol = SMB2_02")
+    else:
+        confset1(smb4_conf, "server min protocol = NT1")
 
     server_max_protocol = fs().services.smb.config.server_max_protocol
     if server_max_protocol != 'NONE':
@@ -1005,8 +1013,11 @@ def generate_smb4_conf(client, smb4_conf, role):
     confset1(smb4_conf, "deadtime = 15")
     confset1(smb4_conf, "max log size = 51200")
 
-    if is_truenas_ha:
+    if truenas_params['is_truenas_ha'] and truenas_params['smb_ha_mode'] == 'LEGACY':
         confset1(smb4_conf, "private dir = /root/samba/private")
+    else:
+        confset1(smb4_conf, "private dir = /var/db/samba4/private")
+
 
     confset2(smb4_conf, "max open files = %d",
              int(get_sysctl('kern.maxfilesperproc')) - 25)
@@ -1021,7 +1032,7 @@ def generate_smb4_conf(client, smb4_conf, role):
     else:
         confset1(smb4_conf, "logging = file")
 
-    if is_truenas_ha:
+    if truenas_params['is_truenas_ha'] and truenas_params['smb_ha_mode'] == 'LEGACY':
         confset1(smb4_conf, "winbind netbios alias spn = false")
 
     confset1(smb4_conf, "load printers = no")
@@ -1249,13 +1260,12 @@ def generate_smb4_system_shares(client, smb4_shares):
 
                 confset1(smb4_shares, "path = %s" % (path))
                 confset1(smb4_shares, "read only = no")
+                # map_dacl_protected=true and nfs4:mode=simple are required
+                # to pass samba-tool ACL validation on GPOs
+                confset1(smb4_shares, "zfsacl:map_dacl_protected=true")
+                confset1(smb4_shares, "nfs4:mode=simple")
+                confset1(smb4_shares, "nfs4:chown=true")
 
-                vfs_objects = []
-
-                extend_vfs_objects_for_zfs(path, vfs_objects)
-                config_share_for_vfs_objects(smb4_shares, vfs_objects)
-
-                config_share_for_nfs4(smb4_shares)
                 config_share_for_zfs(smb4_shares)
 
         except Exception as e:
@@ -1317,11 +1327,10 @@ def smb4_unlink(dir):
 
 
 def smb4_setup(client):
-    global is_truenas_ha
     statedir = "/var/db/samba4"
     privatedir = "/var/db/samba4/private"
 
-    if is_truenas_ha:
+    if truenas_params['is_truenas_ha'] and truenas_params['smb_ha_mode'] == "LEGACY":
         privatedir = "/root/samba/private"
 
     if not os.access(privatedir, os.F_OK):
@@ -1337,7 +1346,7 @@ def smb4_setup(client):
     smb4_unlink("/usr/local/etc/smb.conf")
     smb4_unlink("/usr/local/etc/smb4.conf")
 
-    if not client.call('notifier.is_freenas') and client.call('notifier.failover_status') == 'BACKUP':
+    if truenas_params['failover_status'] == 'BACKUP':
         return
 
     systemdataset = client.call('systemdataset.config')
@@ -1663,10 +1672,29 @@ def smb4_do_migrations(client):
 
     migrate_11_1_U3_to_11_1_U4(client)
 
+def generate_global_stub(cifs, failover_status):
+    if failover_status != "MASTER":
+        with open("/usr/local/etc/smb4.conf", "w") as f:
+            f.write("[global]\n")
+            f.write(f"netbios name = {cifs['netbiosname']}_PASSIVE\n")
+            f.write("multicast dns register = False\n")
+    else:
+        with open("/usr/local/etc/smb4.conf", "w") as f:
+            f.write("[global]\n")
+            f.write("config backend = registry\n")
+
+        return True
+
+def smb4_import_registry_conf(smb_conf_path):
+    p = pipeopen("/usr/local/bin/net -d 0 conf import %s" % smb_conf_path)
+    net_out = p.communicate()
+    if p.returncode != 0:
+        log.error('Failed to import into registry config with following error: {0}'.format(net_out[1]))
+        return False
+    if not net_out:
+        return False
 
 def main():
-    global is_truenas_ha
-
     smb4_tdb = []
     smb4_conf = []
     smb4_shares = []
@@ -1676,10 +1704,16 @@ def main():
     client = Client()
 
     if not client.call('notifier.is_freenas') and client.call('notifier.failover_licensed'):
-        is_truenas_ha = True
+        truenas_params['is_truenas_ha'] = True
+        truenas_params['failover_status'] = client.call('notifier.failover_status')
+        systemdataset = client.call('systemdataset.config')
+        cifs = client.call('smb.config')
+        if systemdataset['pool'] is not 'freenas-boot' and cifs['netbiosname'] == cifs['netbiosname_b']:
+            truenas_params['smb_ha_mode'] = 'UNIFIED'
+            truenas_params['registry_config'] = True 
 
     privatedir = "/var/db/samba4/private"
-    if is_truenas_ha:
+    if truenas_params['is_truenas_ha'] and truenas_params['smb_ha_mode'] == 'LEGACY':
         privatedir = "/root/samba/private"
 
     smb4_setup(client)
@@ -1700,11 +1734,18 @@ def main():
     if role == 'dc' and not client.call('notifier.samba4', 'domain_provisioned'):
         provision_smb4(client)
 
+    if truenas_params['registry_config']:
+        smb_conf_path = "/var/db/samba4/smb4.conf"
+
     with open(smb_conf_path, "w") as f:
         for line in smb4_conf:
             f.write(line + '\n')
         for line in smb4_shares:
             f.write(line + '\n')
+
+    if truenas_params['registry_config']:
+        generate_global_stub(cifs, truenas_params['failover_status'])
+        smb4_import_registry_conf(smb_conf_path)
 
     smb4_set_SID(client, role)
 
