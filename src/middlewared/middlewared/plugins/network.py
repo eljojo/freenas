@@ -1943,7 +1943,10 @@ class DNSService(Service):
                 for ip in cifs['cifs_srv_bindip']:
                     nameservers.append(ip)
             else:
-                nameservers.append('127.0.0.1')
+                ips_in_use = await self.middleware.call('interfaces.ip_in_use')
+                for ip in ips_in_use:
+                    nameservers.append(ip['address'])
+
         else:
             gc = await self.middleware.call('datastore.query', 'network.globalconfiguration', None, {'get': True})
             if gc['gc_domain']:
