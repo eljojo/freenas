@@ -73,6 +73,60 @@ class SMBService(SystemServiceService):
         }
 
     @private
+    async def validate_admin_groups(self, sid):
+        """
+           Check if group mapping already exists. Remove any entries that
+           shouldn't be present. The only default entry here in will have
+           a RID value of "512" (Domain Admins).
+        """
+        proc = await Popen(
+            ['/usr/local/bin/net', 'groupmap', 'listmem', 'S-1-5-32-544'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        member_list = (await proc.communicate())[0].decode()
+        if not member_list:
+            return True
+        for group in member_list.splitlines():
+            group = group.rstrip()
+            if group == sid:
+                continue
+            if group.rsplit('-', 1)[-1] != "512" and group != sid:
+                self.logger.debug(f"Removing {group} from local admins group.")
+                rem = await Popen(
+                    ['/usr/local/bin/net', 'groupmap', 'delmem', 'S-1-5-32-544', group],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                )
+                remout = (await rem.communicate())[0].decode()
+                if remout:
+                    self.logger.debug(f"failed to remove {group} from local admins group")
+                    return False
+
+        return True 
+
+    @private
+    async def add_admin_group(self, sid):
+        ret = await self.validate_admin_groups(sid)
+        if not ret:
+            return False
+        proc = await Popen(
+            ['/usr/local/bin/net', 'groupmap', 'addmem', 'S-1-5-32-544', sid],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        output = (await proc.communicate())[0].decode()
+        return True 
+
+    @private
+    async def wbinfo_gidtosid(self, gid):
+        if not gid:
+            return None
+        proc = await Popen(
+            ['/usr/local/bin/wbinfo', '--gid-to-sid', f"{gid}"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        ) 
+        output = (await proc.communicate())[0].decode()
+        return output.rstrip()
+
+    @private
     async def common_charset_choices(self):
 
         def check_codec(encoding):
@@ -118,6 +172,7 @@ class SMBService(SystemServiceService):
         Bool('domain_logons'),
         Bool('timeserver'),
         Str('guest'),
+        Str('admin_group'),
         Str('filemask'),
         Str('dirmask'),
         Bool('nullpw'),
@@ -163,6 +218,18 @@ class SMBService(SystemServiceService):
                     raise ValueError('Not an octet')
             except (ValueError, TypeError):
                 verrors.add(f'smb_update.{i}', 'Not a valid mask')
+
+        if new['admin_group']:
+            group = await self.middleware.call("notifier.get_group_object", new["admin_group"])
+            admin_sid = None
+            if group:
+                admin_sid = await self.wbinfo_gidtosid(group[2])
+                if not admin_sid:
+                    verrors.add('smb_update.admin_group', f"Unable to obtain SID to GID mapping: {group[0]}")
+                else:
+                    ret = await self.add_admin_group(admin_sid)
+                    if not ret:
+                        verrors.add('smb_update.admin_group', f"Failed to add admin group: {group[0]}")
 
         if verrors:
             raise verrors
