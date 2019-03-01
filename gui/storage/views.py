@@ -1185,6 +1185,9 @@ def vmwareplugin_datastores(request):
         data['value'] = []
         for i in ds.values():
             data['value'] += i.keys()
+
+        data['value'] = list(set(data['value']))
+        data['value'].sort()
     except Exception as e:
         data['error'] = True
         data['errmsg'] = str(e)
